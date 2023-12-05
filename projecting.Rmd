@@ -1,0 +1,131 @@
+---
+title: "Untitled"
+author: "Samuel Brown"
+date: "2023-10-26"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+ggplot2::theme_set(ggplot2::theme_bw())
+library(rvest)
+library(xgboost)
+library(tidyverse)
+```
+
+# Read in data
+```{r}
+gym <- rbind(read.csv("cleandata/data_2017_2021.csv"), read.csv("cleandata/data_2022_2023.csv")) %>% 
+  unique() %>% 
+  mutate(Name = str_to_title(paste(FirstName, LastName, sep = " ")))
+
+head(gym)
+```
+
+##################################################################################################
+# Cleaning
+```{r}
+## Put dates as month/year uniformly
+## Look at 0 scores as did not compete vs true 0
+## Standardize apparatus notation(UB and UE are the same)
+# Don't take out rows with NAs for all
+# When estimating aging curve maybe take Simone out, also look at rule changes on age
+# Figure out if different apparatuses have a penalty when deciding NA vs 0. 
+# Think about vault 1 vs 2 and how we want to approach that
+# Figure out ages
+cleaned_gym <- gym %>% 
+  mutate(date2 = dmy(gsub(".*-","", Date)),
+         Score = ifelse(E_Score == 0 & D_Score == 0 & Score == 0, NA, Score),
+         Apparatus = ifelse(Apparatus == "UE", "UB", Apparatus),
+         Birthday = coalesce(
+           mdy(Birthday, quiet = TRUE),
+           mdy(paste0("01-01-", Birthday), quiet = TRUE)
+          ),
+         Age = as.numeric(date2 - Birthday)
+         )
+
+head(cleaned_gym)
+```
+
+##################################################################################################
+# Calculate pi(Probability of qualifying, dependent on athlete, apparatus, and time). Start by estimating their true talent level in a given event. True talewnt level should be a distribution tho. 
+### Get data ready for modeling
+```{r}
+model_data <- cleaned_gym %>% 
+  # Turn all vaults into 1 vault score and drop non uniques(Rank gets discarded)
+  mutate(Apparatus = substr(Apparatus, 1, 2)) %>% 
+  group_by(LastName, FirstName, Apparatus, date2, Round) %>% 
+  mutate(E_Score = ifelse(is.na(E_Score), NA, E_Score[which.max(Score)]),
+         D_Score = ifelse(is.na(D_Score), NA, D_Score[which.max(Score)]),
+         Score = max(Score)) %>% 
+  distinct_at(vars(-Rank)) %>% 
+  # Turn into past performance model
+  group_by(LastName, FirstName, Apparatus) %>% 
+  mutate(final_date = max(date2),
+         final_score = Score[which.max(date2)],
+         time_gap = final_date - date2) %>% 
+  ungroup() %>% 
+  filter(time_gap != 0,
+         !is.na(D_Score),
+         D_Score != 0,
+         !is.na(E_Score),
+         E_Score != 0) 
+```
+
+### Linear model
+```{r}
+model_data %>% 
+  drop_na(Age) %>% 
+  lm(data = ., formula = final_score ~ Gender + D_Score + E_Score + Penalty + time_gap + Apparatus + 
+       Apparatus*E_Score + Apparatus*D_Score + poly(Age, 2)) %>% 
+  summary()
+```
+
+### XgBoost
+```{r}
+set.seed(200)
+# Get data ready to xgboost
+train_mat <- model_data %>% 
+  select(Gender, D_Score, E_Score, Penalty, time_gap, Apparatus, Age) %>% 
+  data.matrix() %>% 
+  xgb.DMatrix(label = model_data %>% select(final_score) %>% as.matrix())
+# Run CV
+train_boost <- xgb.cv(data = train_mat, objective = "reg:squarederror", nrounds = 100, nfold = 7, verbose = 0)
+# Graph the performance
+train_boost$evaluation_log %>% 
+  ggplot(aes(x = iter)) +
+  geom_point(aes(y = train_rmse_mean), color = 'orange', alpha = .7) +
+  geom_point(aes(y = test_rmse_mean), color = 'blue', alpha = .7) +
+  geom_line(aes(y = train_rmse_mean, color = 'train'), alpha = .7) +
+  geom_line(aes(y = test_rmse_mean, color = 'test'), alpha = .7) +
+  geom_point(data = train_boost$evaluation_log %>% slice_min(test_rmse_mean), aes(y = test_rmse_mean), 
+                                                               color = 'red', size = 4) +
+  labs(y = 'CV Mean Logloss', x = 'Iteration') +
+  scale_color_manual(values = c('train' = 'orange', 'test' = 'blue'))
+```
+
+```{r}
+# Make xgboost
+optimal_rounds <- train_boost$evaluation_log %>%
+  slice_min(test_rmse_mean) %>% 
+  pull(iter)
+final_boost_model <- xgboost(data = train_mat, objective = "reg:squarederror", nrounds = optimal_rounds, verbose = FALSE)
+# Look at results
+cbind(model_data,
+      xgboost_preds = predict(final_boost_model, 
+                              model_data %>% select(Gender, D_Score, E_Score, Penalty, time_gap, Apparatus, Age) %>% 
+                                data.matrix() %>% xgb.DMatrix())) %>% 
+  filter(Country == "USA") %>% 
+  group_by(FirstName, LastName) %>% 
+  summarize(ct = n(),
+            avg_resid = mean(final_score - xgboost_preds), 
+            .groups = "drop") %>% 
+  arrange(-avg_resid)
+```
+
+
+
+
+# Next week:
+ - Get data and model
+ - Data could include ages, injury data, training from youth, etc.

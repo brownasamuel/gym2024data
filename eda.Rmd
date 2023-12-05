@@ -1,0 +1,52 @@
+---
+title: "Untitled"
+author: "Samuel Brown"
+date: "2023-10-26"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+ggplot2::theme_set(ggplot2::theme_bw())
+library(tidyverse)
+```
+
+# Read in data
+```{r}
+gym <- rbind(read.csv("cleandata/data_2017_2021.csv"), read.csv("cleandata/data_2022_2023.csv")) %>% 
+  unique() %>% 
+  mutate(Name = str_to_title(paste(FirstName, LastName, sep = " ")))
+
+head(gym)
+```
+
+# EDA
+```{r}
+#summary(gym)
+#str(gym)
+```
+
+```{r}
+# You can figure out some NA E_Scores from D_Score and Score, and 5 Scores from D_Score and E_Score(But idk what penalty does there)
+gym %>% filter(is.na(Score), !is.na(D_Score))
+
+gym %>% 
+  filter(is.na(Penalty)) %>% 
+  group_by(Apparatus) %>% 
+  summarize(ct = n())
+# Make sure that for women at Tokyo and people at Liverpool the penalty and score is fixed
+gym %>% 
+  mutate(diff = Score - (D_Score + E_Score - Penalty)) %>% 
+  filter(abs(diff) > .1) 
+```
+
+```{r}
+# The character variables are all there(No NAs)
+hist(gym$Rank)
+hist(gym$D_Score)
+hist(gym$E_Score)
+hist(gym$Penalty)
+hist(gym$Score)
+```
+
+

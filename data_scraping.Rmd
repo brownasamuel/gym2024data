@@ -1,0 +1,348 @@
+---
+title: "Untitled"
+author: "Samuel Brown"
+date: "2023-10-26"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+ggplot2::theme_set(ggplot2::theme_bw())
+library(rvest)
+library(xgboost)
+library(tidyverse)
+library(countrycode)
+```
+
+# Read in data
+```{r, warning = FALSE}
+gym <- rbind(read.csv("cleandata/data_2017_2021.csv"), read.csv("cleandata/data_2022_2023.csv")) %>% 
+  unique() %>% 
+  mutate(Name = str_to_title(paste(FirstName, LastName, sep = " ")),
+         Country = countrycode( Country, 
+                               origin = 'ioc', destination = 'country.name.en', 
+                               custom_match = c("ROC" = "Russia", "IOM" = "Isle of Man", 
+                                                "WAL" = "Wales", "ENG" = "England", 
+                                                "SCO" = "Scotland", "SIN" = "Singapore", 
+                                                "GE1" = "Germany", "NIR" = "Northern Ireland",
+                                                "GE2" = "Germany", "JEY" = "Jersey", 
+                                                "CCS" = "Guatemala", "EAI" = "Guatemala") )) 
+
+head(gym)
+```
+
+##################################################################################################
+# Get more data
+### Gymter names, events, ages
+```{r}
+get_gymter_names <- function(url) {
+  # Read the HTML content of the page
+  page <- read_html(url)
+  
+  # Extract all links on the page along with their text content
+  all_links <- page %>% html_nodes("a") %>% html_attr("href")
+  all_names <- page %>% html_nodes("a") %>% html_text()
+  
+  # Create a data frame with links and names
+  gymnast_data <- data.frame(Link = all_links, Name = all_names, stringsAsFactors = FALSE)
+  
+  return(gymnast_data)
+}
+
+# Example usage for the main page
+gymter_names <- get_gymter_names("https://thegymter.net/gymnast-database/")
+```
+
+```{r, warning = FALSE}
+get_gymter_events <- function(Names, Links) {
+  # Initialize an empty data frame to store the results
+  event_results <- data.frame(Name = character(), Date = character(), Competition = character(), 
+                              Round = character(), Apparatus = character(), Score = numeric(), 
+                              Birthday = character(), Gender = character(),
+                              stringsAsFactors = FALSE)
+
+  # Loop through each name and link
+  for (i in seq_along(Names)) {
+    name <- Names[i]
+    link <- Links[i]
+
+    tryCatch({
+      # Try to read the HTML content
+      link_html <- link %>% 
+        read_html()
+      
+      # Get relevant years for dating the competition
+      years <- link_html %>%
+        html_nodes(xpath = '//*[@id="content"]//p/strong[contains(text(), "Results")]') %>%
+        html_text() %>%
+        str_extract("\\d+") %>%
+        as.numeric() %>% 
+        rev()
+
+      # Extract the tables
+      tables <- link_html %>%
+        html_nodes(xpath = '//*[@id="content"]//table') %>%
+        html_table(header = TRUE, na.strings = c("——", ""), convert = TRUE) %>% 
+        rev()
+      tables <- tables[1:length(years)]
+      
+      # Get birthday
+      birthday <- link_html %>% 
+        html_element(xpath = "/html/body/div[1]/div[2]/div[1]/div/article/div/table[1]/tbody/tr[3]/td[2]") %>%
+        html_text()
+
+      # Combine the years and tables
+      combined_data <- Map(cbind, Year = years, tables)
+
+      # Bind all the tables into one
+      result_table <- do.call(rbind, combined_data) %>% 
+        rename(Round = Var.4)
+
+      # Select relevant columns and update the Date column
+      result_table <- result_table %>%
+        mutate(across(VT:AA, ~ 
+                        tryCatch(as.numeric(str_remove_all(as.character(.), "\\*$")), 
+                                 error = function(e) NA)
+                      )) %>%
+        pivot_longer(cols = VT:AA, names_to = "Apparatus", values_to = "Score") %>% 
+        mutate(Name = name,
+               Date = paste(Date, Year, sep = " "),
+               Birthday = birthday,
+               Gender = 'w') %>% 
+        select(-Year)
+
+      # Append the result, name, and link to the data frame
+      event_results <- bind_rows(event_results, result_table)
+
+    }, 
+    # If it doesn't work, return NA
+    error = function(e){
+      return(NA)
+    })
+  }
+  
+  # Return the scraped data frame
+  return(event_results)
+}
+
+gymter_events <- get_gymter_events(Names = gymter_names %>% slice(49:1059) %>% pull(Name), 
+                                   Links = gymter_names %>% slice(49:1059) %>% pull(Link))
+write.csv(gymter_events, file = "gymter_events.csv", row.names = FALSE)
+
+
+gym <- bind_rows(gymter_events, gym) %>% 
+  group_by(Name) %>%
+  mutate(Birthday = ifelse(all(is.na(Birthday)), NA, first(Birthday))) %>%
+  ungroup() 
+head(gym)
+```
+
+### Wikipedia Olympic Finals
+```{r}
+get_olympic_links <- function(Years){
+  # Make link_list
+  link_list <- c()
+  
+  for (year in Years){
+    # Make the proper Wikipedia URL
+    url <- paste("https://en.wikipedia.org/wiki/Gymnastics_at_the_", year, "_Summer_Olympics",
+                 sep = "")
+    # Get all of the event results from that Olympics
+    links <- url %>% 
+      read_html() %>%
+      html_nodes(xpath = '//*[@id="mw-content-text"]/div[1]/table[2]/tbody//a') %>%
+      html_attr("href") %>%
+      keep(~grepl(paste("/wiki/Gymnastics_at_the_", year, "_Summer_Olympics", sep = ""), .) & 
+             (grepl("Men", .) | grepl("Women", .))) %>% 
+      paste0("https://en.wikipedia.org", .)
+    # Add to list of links
+    link_list <- append(link_list, links)
+  }
+  return(link_list)
+}
+
+all_olympic_links <- get_olympic_links(seq(2000, 2020, by = 4))
+```
+
+```{r}
+scrape_wiki_tables <- function(link){
+  # Make useful functions for the future
+  ### Check if it has numbers/scores
+  has_numeric_columns <- function(df){
+    any(sapply(df, is.numeric))
+  }
+  ### Check if a table has the right kind of scores
+  new_scoring <- function(df){
+    return(!any(colnames(df) %in% countrycode::codelist$country.name.en) & ("Total" %in% colnames(df)))
+  }
+  ### Get ready to reassign column names
+  reconcile_headers <- function(df) {
+    header_row <- df[1, ]
+    df <- df[-1, ]
+    colnames(df) <- make.unique(make.names(header_row), sep = "_")
+    return(df)
+  }
+
+  ##############################################################################
+  ##### Getting the tables out
+  # Read HTML content
+  page <- read_html(link)
+
+  # Extract tables
+  tables <- page %>%
+    html_nodes("table") %>%
+    map(html_table, header = TRUE, fill = TRUE)
+  
+  for (i in 1:length(tables)){
+    table <- tables[[i]]
+    
+    if (  any(c("Rank", "Position", "Gymnast", "Name", "Nation", "Country", "Total") %in% table[1, ])  ){
+      if("Total" %in% colnames(table)){
+        tables[[i]] <- reconcile_headers(table) %>% 
+          mutate(Total = suppressWarnings(as.numeric(Total)))
+      } else if("Score" %in% colnames(table)){
+        tables[[i]] <- reconcile_headers(table) %>% 
+          mutate(Score = suppressWarnings(as.numeric(Score))) %>% 
+          rename(Total = Score)
+      }
+
+    }
+  }
+  
+  # Filter out tables that aren't useful
+  tables_mask <- lapply(tables, has_numeric_columns)
+  tables <- tables[unlist(tables_mask)]
+  tables_mask <- lapply(tables, new_scoring)
+  tables <- tables[unlist(tables_mask)]
+  # Check if there are no more links
+  if (length(tables) == 0){
+    return(NA)
+  } else {
+  ##############################################################################
+  ##### Cleaning and standardizing the tables
+  # Find the apparatus from the link
+  sport <- str_extract(link, "(?<=\\%27s_).*")
+  event_mapping <- c(
+    "balance_beam" = "BB",
+    "vault" = "VT",
+    "floor" = "FX",
+    "uneven_bars" = "UB",
+    "parallel_bars" = "PB",
+    "horizontal_bar" = "HB",
+    "trampoline" = "TRA",
+    'pommel_horse' = "PH",
+    'rings' = 'SR'
+    )
+  app_abbrev <- event_mapping[sport]
+  
+  # Find gender from the link
+  link_str <- sub("%27s_.*$", "", link)
+  full_gender <- sub(".+_", "", link_str)
+  gender <- tolower(substr(full_gender, 1, 1))
+  
+  # Find the dates and assign based on how complete the information is
+  year <- gsub(".*_(\\d{4}).*", "\\1", link)
+  comp_dates <- read_html(link) %>% 
+    html_nodes(".infobox-data") %>% 
+    keep(grepl("August", .) | grepl("July", .) | grepl("September", .)) %>% 
+    html_text() %>% 
+    str_match_all("(\\d+\\s+\\w+(?:\\s+\\d{4})?)") %>% 
+    unlist()
+  if (is.null(comp_dates[1])){ 
+    # If no dates given, assume late July and early August?
+    qual_date <- NA #paste("25 July", year) %>% dmy()
+    final_date <- NA #paste("2 August", year) %>% dmy()
+  } else if (1 + str_count(comp_dates[1] ,"\\W+") == 3){
+    qual_date <- comp_dates[1] %>% dmy()
+    final_date <- comp_dates[2] %>% dmy()
+  } else if(1 + str_count(comp_dates[1] ,"\\W+") == 2){
+    qual_date <- paste(comp_dates[1], year) %>% dmy()
+    final_date <- paste(comp_dates[2], year) %>% dmy()
+  } 
+  
+  # Go through each table and:
+    # Get column names to match up
+    # Fix the country column to be consistent
+    # Fix the score column so it works and is numeric
+    # Label as qualifier or gold medal round and add in the date
+    # Label apparatus & gender
+    # Standardize column names
+  for (i in 1:length(tables)){
+    table <- tables[[i]]
+    # Make sure the Rank and Name columns are consistent 
+    table <- table %>% 
+      rename(Rank = 1, Name = 2) 
+    # Make Country a column if not already in
+    if (!('Nation' %in% colnames(table)) & !('Country' %in% colnames(table))){
+      table <- table %>% 
+        mutate(Country = countrycode( str_remove_all(str_extract(Name, "\\((.*?)\\)"), "[()]"), 
+                                     origin = 'ioc', destination = 'country.name.en', 
+                                     custom_match = c("ROC" = "Russia") ) %>% suppressWarnings(),
+               Name = str_trim(str_remove_all(Name, "\\(.*?\\)"))) %>%
+        relocate(Country, .after = Name)
+    } else if('Nation' %in% colnames(table)){
+        table <- table %>% 
+          rename(Country = Nation)
+      }
+    
+    # Fix score columns if it has non-numeric characters
+    table <- table %>% 
+      mutate(Total = as.numeric(gsub("[^0-9.]", "", Total)))
+
+    # Change rank to be more accurate and label as final or qualifying round
+    # Also add date
+    table$Rank <- as.numeric(table$Rank)
+    if (is.na(table[1, 'Rank'])){
+      table$Round <- 'final'
+      table$Date <- final_date
+      table$Rank <- rank(-table$Total, ties.method = "min")
+    } else{
+      table$Round <- 'qual'
+      table$Date <- qual_date
+    }
+    # Label apparatus and gender
+    table$Apparatus <- app_abbrev
+    table$Gender <- gender
+    # Get consistent column names
+    if (ncol(table) %in% c(16, 17)){
+      table <- table %>% 
+        rename(D_Score1 = 4, E_Score1 = 5, Penalty1 = 6, Score1 = 7,
+               D_Score2 = 8, E_Score2 = 9, Penalty2 = 10, Score2 = 11) %>% 
+        mutate(Penalty1 = abs(as.numeric(Penalty1)) %>% suppressWarnings(),
+               Penalty2 = abs(as.numeric(Penalty2)) %>% suppressWarnings()) %>% 
+        select(Rank, Name, Country, D_Score1, E_Score1, Penalty1, Score1, 
+               D_Score2, E_Score2, Penalty2, Score2,
+               Total, Round, Date, Apparatus, Gender)
+    } else if(ncol(table) %in% c(11, 12)){
+      table <- table %>% 
+        rename(D_Score = 4, E_Score = 5, Penalty = 6) %>% 
+        mutate(Penalty = abs(as.numeric(Penalty))) %>% 
+        select(Rank, Name, Country, D_Score, E_Score, Penalty, Total, Round, Date, Apparatus, Gender)
+    }
+    
+    # Put the modified table back into the list
+    tables[[i]] <- table
+  }
+  
+  # Return the list of tables
+  return(tables)
+  }
+}
+```
+
+
+```{r, WARNING = FALSE}
+all_olympic_vaults <- all_olympic_links %>% 
+  keep(~grepl("vault", .)) %>% 
+  map(scrape_wiki_tables) %>% 
+  purrr::list_flatten() %>% 
+  keep(.p = !is.na(.)) %>% 
+  bind_rows()
+
+all_olympic_vaults 
+```
+
+
+
+
+
